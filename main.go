@@ -66,22 +66,32 @@ type model struct {
 	loading bool
 
 	// data cache
-	nsList       []string
-	typeList     []resType
-	ownerList    []string
-	podList      []string
+	nsList        []string
+	typeList      []resType
+	ownerList     []string
+	podList       []string
 	containerList []string
 
 	// repl
-	output         strings.Builder
-	outputLines    []string  // track output lines for copying
-	autocompleteWords map[string]bool  // unique words from output for autocomplete
-	history        []string
-	histIdx        int
-	lastErr        string
-	width          int
-	height         int
-	currentDir     string // track current directory in pod
+	output            strings.Builder
+	outputLines       []string        // track output lines for copying
+	autocompleteWords map[string]bool // unique words from output for autocomplete
+	history           []string
+	histIdx           int
+	lastErr           string
+	width             int
+	height            int
+	currentDir        string // track current directory in pod
+
+	// debug container support
+	useDebugContainer         bool   // whether to use ephemeral debug container
+	debugContainer            string // name of the debug container
+	targetRoot                string // root filesystem path of target container (/proc/<pid>/root)
+	originalPodSecurityPolicy string // original PodSecurity enforce policy to restore on quit
+	changedPodSecurityPolicy  bool   // whether we changed the policy
+
+	// quit handling
+	quitting bool // whether we're in the process of quitting
 }
 
 var (
@@ -96,7 +106,7 @@ func initialModel() *model {
 	// list
 	delegate := list.NewDefaultDelegate()
 	delegate.ShowDescription = false
-	delegate.SetSpacing(0)  // Compact spacing
+	delegate.SetSpacing(0) // Compact spacing
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "Velg namespace"
 	l.SetShowHelp(false)
@@ -274,6 +284,163 @@ func getContainers(namespace, pod string) ([]string, error) {
 	return res, nil
 }
 
+func getPodSecurityPolicy(namespace string) (string, error) {
+	// Get the current pod-security.kubernetes.io/enforce label
+	args := []string{"get", "namespace", namespace, "-o", "jsonpath={.metadata.labels.pod-security\\.kubernetes\\.io/enforce}"}
+	out, _, err := runKubectl(args...)
+	if err != nil {
+		return "", err
+	}
+	policy := strings.TrimSpace(string(out))
+	if policy == "" {
+		// No policy set - return empty string to indicate no label
+		return "", nil
+	}
+	return policy, nil
+}
+
+func setPodSecurityPolicy(namespace, policy string) error {
+	if policy == "" {
+		// Remove the label if policy is empty
+		args := []string{"label", "namespace", namespace, "pod-security.kubernetes.io/enforce-"}
+		_, stderr, err := runKubectl(args...)
+		if err != nil {
+			return fmt.Errorf("failed to remove PodSecurity policy label: %w (stderr: %s)", err, string(stderr))
+		}
+		return nil
+	}
+
+	// Set the pod-security.kubernetes.io/enforce label
+	args := []string{"label", "namespace", namespace, fmt.Sprintf("pod-security.kubernetes.io/enforce=%s", policy), "--overwrite"}
+	_, stderr, err := runKubectl(args...)
+	if err != nil {
+		return fmt.Errorf("failed to set PodSecurity policy: %w (stderr: %s)", err, string(stderr))
+	}
+	return nil
+}
+
+func createDebugContainer(namespace, pod, targetContainer string) (string, string, error) {
+	debugName := fmt.Sprintf("kcmd-debug-%d", time.Now().Unix())
+
+	// Build ephemeral container spec
+	// Run as root with capabilities needed for nsenter
+	ephemeralContainer := map[string]interface{}{
+		"name":                debugName,
+		"image":               "busybox:latest",
+		"targetContainerName": targetContainer,
+		"command":             []string{"sleep", "3600"},
+		"securityContext": map[string]interface{}{
+			"allowPrivilegeEscalation": false,
+			"runAsUser":                0, // Run as root
+			"capabilities": map[string]interface{}{
+				"drop": []string{"ALL"},
+				"add":  []string{"SYS_ADMIN", "SYS_CHROOT", "SYS_PTRACE"}, // Required for nsenter
+			},
+			"seccompProfile": map[string]interface{}{
+				"type": "RuntimeDefault",
+			},
+		},
+	}
+
+	// Get current pod spec to append ephemeral container
+	getPodCmd := []string{"get", "pod", pod, "-n", namespace, "-o", "json"}
+	podJSON, _, err := runKubectl(getPodCmd...)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get pod: %w", err)
+	}
+
+	var podSpec map[string]interface{}
+	if err := json.Unmarshal(podJSON, &podSpec); err != nil {
+		return "", "", fmt.Errorf("failed to parse pod spec: %w", err)
+	}
+
+	// Add ephemeral container to spec
+	spec := podSpec["spec"].(map[string]interface{})
+	ephemeralContainers, ok := spec["ephemeralContainers"].([]interface{})
+	if !ok {
+		ephemeralContainers = []interface{}{}
+	}
+	ephemeralContainers = append(ephemeralContainers, ephemeralContainer)
+	spec["ephemeralContainers"] = ephemeralContainers
+
+	// Marshal back to JSON
+	patchedSpec, err := json.Marshal(podSpec)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal patched spec: %w", err)
+	}
+
+	// Apply the patch
+	patchCmd := []string{
+		"replace", "--raw",
+		fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/ephemeralcontainers", namespace, pod),
+		"-f", "-",
+	}
+
+	cmd := exec.Command("kubectl", patchCmd...)
+	cmd.Stdin = bytes.NewReader(patchedSpec)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", "", fmt.Errorf("failed to create ephemeral container: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// Wait for container to be ready
+	time.Sleep(3 * time.Second)
+
+	// Find the target container's PID
+	// With --target, we share process namespace, so target processes are visible
+	// Look for the process that's NOT sleep (our debug container)
+
+	findPIDCmd := []string{
+		"-n", namespace, "exec", pod,
+		"-c", debugName,
+		"--",
+		"sh", "-c",
+		// List all processes, exclude sleep and sh, take the first one
+		"ps -o pid,comm | grep -v 'PID' | grep -v 'sleep' | grep -v 'sh' | grep -v 'ps' | grep -v 'grep' | head -1 | awk '{print $1}'",
+	}
+	pidOut, _, _ := runKubectl(findPIDCmd...)
+	pid := strings.TrimSpace(string(pidOut))
+
+	if pid == "" {
+		// Fallback: try to find by listing /proc and checking cmdline
+		findPIDCmd2 := []string{
+			"-n", namespace, "exec", pod,
+			"-c", debugName,
+			"--",
+			"sh", "-c",
+			"for p in /proc/[0-9]*; do [ -f $p/cmdline ] && [ -s $p/cmdline ] && cat $p/cmdline 2>/dev/null | grep -qv sleep && echo $(basename $p) && break; done",
+		}
+		pidOut2, _, _ := runKubectl(findPIDCmd2...)
+		pid = strings.TrimSpace(string(pidOut2))
+	}
+
+	if pid == "" {
+		return "", "", fmt.Errorf("could not find target container PID")
+	}
+
+	// Test if nsenter is available and works
+	testNsenterCmd := []string{
+		"-n", namespace, "exec", pod,
+		"-c", debugName,
+		"--",
+		"sh", "-c",
+		fmt.Sprintf("nsenter -t %s -m -u -i -p -- pwd 2>&1", pid),
+	}
+	nsenterOut, _, nsenterErr := runKubectl(testNsenterCmd...)
+
+	if nsenterErr == nil && strings.TrimSpace(string(nsenterOut)) != "" {
+		// nsenter works! Use it
+		return debugName, fmt.Sprintf("NSENTER:%s", pid), nil
+	}
+
+	// Fallback to /proc/<pid>/root if nsenter doesn't work
+	targetRoot := fmt.Sprintf("/proc/%s/root", pid)
+	return debugName, targetRoot, nil
+}
+
 func execInPod(namespace, pod, container, cmdline, currentDir string) (string, string, error) {
 	// Ikke TTY (-it) => stabilt i TUI. Bruk sh -lc for pipes/redirects.
 	fullCmd := cmdline
@@ -281,6 +448,38 @@ func execInPod(namespace, pod, container, cmdline, currentDir string) (string, s
 		fullCmd = fmt.Sprintf("cd %s && %s", currentDir, cmdline)
 	}
 	out, errb, err := runKubectl("-n", namespace, "exec", pod, "-c", container, "--", "sh", "-lc", fullCmd)
+	return string(out), string(errb), err
+}
+
+func execInDebugContainer(namespace, pod, debugContainer, targetRoot, cmdline, currentDir string) (string, string, error) {
+	// Check if we should use nsenter (targetRoot starts with NSENTER:)
+	if strings.HasPrefix(targetRoot, "NSENTER:") {
+		pid := strings.TrimPrefix(targetRoot, "NSENTER:")
+
+		// Build command to run in target namespace using nsenter
+		targetCmd := cmdline
+		if currentDir != "" && currentDir != "~" {
+			targetCmd = fmt.Sprintf("cd %s && %s", currentDir, cmdline)
+		}
+
+		// Escape the command for shell
+		escapedCmd := strings.ReplaceAll(targetCmd, "'", "'\"'\"'")
+		fullCmd := fmt.Sprintf("nsenter -t %s -m -u -i -p -- sh -c '%s'", pid, escapedCmd)
+
+		out, errb, err := runKubectl("-n", namespace, "exec", pod, "-c", debugContainer, "--", "sh", "-c", fullCmd)
+		return string(out), string(errb), err
+	}
+
+	// Fallback to /proc/<pid>/root approach
+	var fullCmd string
+	if currentDir != "" && currentDir != "~" {
+		fullCmd = fmt.Sprintf("cd %s%s && %s", targetRoot, currentDir, cmdline)
+	} else {
+		// Default to root of target container
+		fullCmd = fmt.Sprintf("cd %s && %s", targetRoot, cmdline)
+	}
+
+	out, errb, err := runKubectl("-n", namespace, "exec", pod, "-c", debugContainer, "--", "sh", "-c", fullCmd)
 	return string(out), string(errb), err
 }
 
@@ -293,8 +492,14 @@ type loadMsg struct {
 	values []string
 }
 
+type debugContainerMsg struct {
+	debugContainer string
+	targetRoot     string
+	err            error
+}
+
 type cmdResultMsg struct {
-	cmd   string
+	cmd    string
 	stdout string
 	stderr string
 	err    error
@@ -335,12 +540,31 @@ func loadStep(s step, m model) tea.Cmd {
 	}
 }
 
-func runCommand(ns, pod, container, cmdline, currentDir string) tea.Cmd {
+func runCommand(ns, pod, container, cmdline, currentDir string, useDebug bool, debugContainer, targetRoot string) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
-		stdout, stderr, err := execInPod(ns, pod, container, cmdline, currentDir)
+		var stdout, stderr string
+		var err error
+
+		if useDebug {
+			stdout, stderr, err = execInDebugContainer(ns, pod, debugContainer, targetRoot, cmdline, currentDir)
+		} else {
+			stdout, stderr, err = execInPod(ns, pod, container, cmdline, currentDir)
+		}
+
 		return cmdResultMsg{
 			cmd: cmdline, stdout: stdout, stderr: stderr, err: err, took: time.Since(start),
+		}
+	}
+}
+
+func createDebugContainerCmd(ns, pod, container string) tea.Cmd {
+	return func() tea.Msg {
+		debugName, targetRoot, err := createDebugContainer(ns, pod, container)
+		return debugContainerMsg{
+			debugContainer: debugName,
+			targetRoot:     targetRoot,
+			err:            err,
 		}
 	}
 }
@@ -383,9 +607,9 @@ func (m *model) header() string {
 func (m *model) help() string {
 	switch m.step {
 	case stepShell:
-		return helpStyle.Render("enter=kjør  tab=autocomplete  ↑/↓=historikk  pgup/pgdn=scroll  /copy 1,10=copy  ctrl+r=retarget  q=quit")
+		return helpStyle.Render("enter=kjør  tab=autocomplete  ↑/↓=historikk  pgup/pgdn=scroll  /copy 1,10=copy  /quit=exit  ctrl+r=retarget")
 	default:
-		return helpStyle.Render("enter=velg  / = filter  esc=tilbake  q=quit")
+		return helpStyle.Render("enter=velg  / = filter  esc=tilbake  ctrl+c=quit")
 	}
 }
 
@@ -393,20 +617,20 @@ func (m *model) appendOutput(s string) {
 	if s == "" {
 		return
 	}
-	
+
 	// Split into lines and add each non-empty line to our tracking array
 	lines := strings.Split(s, "\n")
 	var numbered strings.Builder
-	
+
 	for _, line := range lines {
 		if line == "" && !strings.HasSuffix(s, "\n") {
 			// Skip empty lines unless they were explicitly part of the input
 			continue
 		}
-		
+
 		// Add to tracking array
 		m.outputLines = append(m.outputLines, line)
-		
+
 		// Extract words for autocomplete (skip line numbers and separators)
 		words := strings.Fields(line)
 		for _, word := range words {
@@ -415,7 +639,7 @@ func (m *model) appendOutput(s string) {
 				m.autocompleteWords[word] = true
 			}
 		}
-		
+
 		// Build numbered display
 		lineNum := len(m.outputLines)
 		if line != "" {
@@ -424,7 +648,7 @@ func (m *model) appendOutput(s string) {
 			numbered.WriteString(fmt.Sprintf("%4d │\n", lineNum))
 		}
 	}
-	
+
 	m.output.WriteString(numbered.String())
 	content := m.output.String()
 	m.vp.SetContent(content)
@@ -449,8 +673,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// layout
 		if m.step == stepShell {
-			m.vp.Width = msg.Width - 2  // just padding
-			m.vp.Height = msg.Height - 3  // header(1) + help(1) + input(1)
+			m.vp.Width = msg.Width - 2   // just padding
+			m.vp.Height = msg.Height - 3 // header(1) + help(1) + input(1)
 			m.input.Width = msg.Width - 2
 		} else {
 			m.lst.SetSize(msg.Width-2, msg.Height-4)
@@ -493,6 +717,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.lastErr = ""
 
+		// Check if command failed due to missing shell (scratch/distroless container)
+		if msg.err != nil && !m.useDebugContainer &&
+			(strings.Contains(msg.stderr, "executable file not found") ||
+				strings.Contains(msg.stderr, "OCI runtime exec failed") ||
+				strings.Contains(msg.stderr, "not found")) {
+			// Try to create debug container
+			m.appendOutput(errStyle.Render("Container has no shell. Creating ephemeral debug container..."))
+			
+			// Check if namespace policy is privileged, if not change it first
+			currentPolicy, err := getPodSecurityPolicy(m.namespace)
+			if err != nil {
+				m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to get current policy: %v", err)))
+				return m, nil
+			}
+			
+			if currentPolicy != "privileged" {
+				m.appendOutput(fmt.Sprintf("Namespace policy is '%s', changing to 'privileged'...", currentPolicy))
+				m.originalPodSecurityPolicy = currentPolicy
+				
+				if err := setPodSecurityPolicy(m.namespace, "privileged"); err != nil {
+					m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to change policy: %v", err)))
+					m.appendOutput("You may need permissions to modify namespace labels.")
+					return m, nil
+				}
+				
+				m.changedPodSecurityPolicy = true
+				m.appendOutput(okStyle.Render("✓ Changed namespace policy to 'privileged'"))
+				m.appendOutput("Policy will be restored to original on quit.")
+				m.appendOutput("")
+			}
+			
+			m.loading = true
+			return m, tea.Batch(m.spin.Tick, createDebugContainerCmd(m.namespace, m.podName, m.container))
+		}
+
 		// Pretty block
 		status := okStyle.Render("OK")
 		if msg.err != nil {
@@ -508,11 +767,72 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case debugContainerMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+
+			// Check if error is due to PodSecurity policy restricting root
+			if strings.Contains(msg.err.Error(), "runAsNonRoot") ||
+				strings.Contains(msg.err.Error(), "runAsUser=0") ||
+				strings.Contains(msg.err.Error(), "PodSecurity") {
+				m.appendOutput(errStyle.Render("Debug container creation blocked by restricted PodSecurity policy"))
+				m.appendOutput("")
+				m.appendOutput("Attempting to temporarily change namespace policy to 'privileged'...")
+
+				// Get current policy
+				currentPolicy, err := getPodSecurityPolicy(m.namespace)
+				if err != nil {
+					m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to get current policy: %v", err)))
+					return m, nil
+				}
+				m.originalPodSecurityPolicy = currentPolicy
+
+				// Set to privileged (baseline doesn't have enough permissions for nsenter)
+				if err := setPodSecurityPolicy(m.namespace, "privileged"); err != nil {
+					m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to change policy: %v", err)))
+					m.appendOutput("You may need permissions to modify namespace labels.")
+					return m, nil
+				}
+
+				m.changedPodSecurityPolicy = true
+				if currentPolicy == "" {
+					m.appendOutput(okStyle.Render("Changed namespace from no policy (unrestricted) to 'privileged'"))
+				} else {
+					m.appendOutput(okStyle.Render(fmt.Sprintf("Changed namespace policy from '%s' to 'privileged'", currentPolicy)))
+				}
+				m.appendOutput("Policy will be restored to original on quit.")
+				m.appendOutput("")
+				m.appendOutput("Retrying debug container creation...")
+				m.loading = true
+				return m, tea.Batch(m.spin.Tick, createDebugContainerCmd(m.namespace, m.podName, m.container))
+			} else {
+				m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to create debug container: %v", msg.err)))
+			}
+			return m, nil
+		}
+
+		m.useDebugContainer = true
+		m.debugContainer = msg.debugContainer
+		m.targetRoot = msg.targetRoot
+		m.currentDir = "/" // Start at root of target container
+		m.appendOutput(okStyle.Render(fmt.Sprintf("Debug container '%s' created.", msg.debugContainer)))
+		m.appendOutput(fmt.Sprintf("Target container filesystem: %s", msg.targetRoot))
+		m.appendOutput("")
+		m.appendOutput("Testing filesystem access...")
+
+		// Test if we can actually access the target root
+		testCmd := fmt.Sprintf("ls %s 2>&1 | head -5", msg.targetRoot)
+		m.loading = true
+		return m, tea.Batch(m.spin.Tick, runCommand(m.namespace, m.podName, m.container, testCmd, "", true, m.debugContainer, m.targetRoot))
+
 	case tea.KeyMsg:
 		k := msg.String()
 
-		// global quit
-		if k == "ctrl+c" || k == "q" {
+		// global quit (only Ctrl+C, q is just a regular key now)
+		if k == "ctrl+c" {
+			// Note: Ephemeral containers cannot be removed, they persist until pod restart
+			// Policy restoration happens in main() after TUI exits
 			return m, tea.Quit
 		}
 
@@ -557,32 +877,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(words) == 0 {
 					return m, nil
 				}
-				
+
 				// Get the last word being typed
 				lastWord := words[len(words)-1]
-				
+
 				// Check if it looks like a path (contains /)
 				if strings.Contains(lastWord, "/") {
 					// Extract directory and partial filename
 					lastSlash := strings.LastIndex(lastWord, "/")
 					dirPath := lastWord[:lastSlash+1]
 					partialFile := lastWord[lastSlash+1:]
-					
-					// Query filesystem in pod for matching files/directories
-					// Use -F to append / to directories, -1 for one per line
-					lsCmd := fmt.Sprintf("ls -1F %s 2>/dev/null | grep '^%s'", dirPath, partialFile)
-					stdout, _, err := execInPod(m.namespace, m.podName, m.container, lsCmd, m.currentDir)
-					
+
+					// Query filesystem for autocomplete - use ls -p to append / to directories
+					lsCmd := fmt.Sprintf(
+						`ls -1p %s 2>/dev/null | grep '^%s'`,
+						dirPath, partialFile,
+					)
+
+					var stdout string
+					var err error
+
+					// Use appropriate execution method based on whether we're in debug container
+					if m.useDebugContainer {
+						stdout, _, err = execInDebugContainer(m.namespace, m.podName, m.debugContainer, m.targetRoot, lsCmd, m.currentDir)
+					} else {
+						stdout, _, err = execInPod(m.namespace, m.podName, m.container, lsCmd, m.currentDir)
+					}
+
 					if err == nil && stdout != "" {
 						lines := strings.Split(strings.TrimSpace(stdout), "\n")
 						if len(lines) > 0 && lines[0] != "" {
-							// Use first match (already has / appended if directory thanks to -F)
-							completedPath := dirPath + lines[0]
-							words[len(words)-1] = completedPath
+							firstMatch := lines[0]
+							// ls -p adds / to directories, so just use the result directly
+							words[len(words)-1] = dirPath + firstMatch
 							m.input.SetValue(strings.Join(words, " "))
 							m.input.CursorEnd()
 						}
 					}
+					// If autocomplete fails (no ls/sh), silently do nothing
 				} else if len(lastWord) >= 2 {
 					// Fall back to word-based autocomplete from output
 					var matches []string
@@ -591,7 +923,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							matches = append(matches, word)
 						}
 					}
-					
+
 					if len(matches) > 0 {
 						sort.Strings(matches)
 						words[len(words)-1] = matches[0]
@@ -630,6 +962,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "enter":
 				cmdline := strings.TrimSpace(m.input.Value())
+
+				// Debug to file since stderr gets cleared
+				f, _ := os.OpenFile("/tmp/kcmd-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if f != nil {
+					fmt.Fprintf(f, "\n=== ENTER PRESSED ===\n")
+					fmt.Fprintf(f, "cmdline: '%s'\n", cmdline)
+					fmt.Fprintf(f, "cmdline == '/quit': %v\n", cmdline == "/quit")
+					fmt.Fprintf(f, "len(cmdline): %d\n", len(cmdline))
+					fmt.Fprintf(f, "step: %v\n", m.step)
+					f.Close()
+				}
+
 				if cmdline == "" {
 					return m, nil
 				}
@@ -643,11 +987,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
+				// Check if command is /quit to quit application
+				if cmdline == "/quit" {
+					f, _ := os.OpenFile("/tmp/kcmd-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+					if f != nil {
+						fmt.Fprintf(f, "\n=== QUIT TRIGGERED ===\n")
+						fmt.Fprintf(f, "changedPodSecurityPolicy: %v\n", m.changedPodSecurityPolicy)
+						fmt.Fprintf(f, "originalPodSecurityPolicy: '%s'\n", m.originalPodSecurityPolicy)
+						fmt.Fprintf(f, "namespace: %s\n", m.namespace)
+						fmt.Fprintf(f, "useDebugContainer: %v\n", m.useDebugContainer)
+						fmt.Fprintf(f, "debugContainer: %s\n", m.debugContainer)
+						f.Close()
+					}
+
+					// Note: Ephemeral containers cannot be removed from running pods
+					// They persist until the pod is deleted/restarted
+					// Policy restoration will happen in main() after TUI exits
+
+					return m, tea.Quit
+				}
+
 				// Check if command is /copy to copy lines to clipboard
 				if strings.HasPrefix(cmdline, "/copy ") {
 					rangeStr := strings.TrimSpace(strings.TrimPrefix(cmdline, "/copy"))
 					var startLine, endLine int
-					
+
 					// Parse range: "255,512" or "255-512" or just "255"
 					if strings.Contains(rangeStr, ",") {
 						fmt.Sscanf(rangeStr, "%d,%d", &startLine, &endLine)
@@ -657,17 +1021,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						fmt.Sscanf(rangeStr, "%d", &startLine)
 						endLine = startLine
 					}
-					
+
 					// Validate range
 					if startLine < 1 || endLine < startLine || endLine > len(m.outputLines) {
 						m.appendOutput(errStyle.Render(fmt.Sprintf("Invalid range. Available lines: 1-%d", len(m.outputLines))))
 						return m, nil
 					}
-					
+
 					// Copy to clipboard
 					linesToCopy := m.outputLines[startLine-1 : endLine]
 					textToCopy := strings.Join(linesToCopy, "\n")
-					
+
 					// Use pbcopy on macOS, xclip/xsel on Linux, clip.exe on Windows
 					var cmd *exec.Cmd
 					if _, err := exec.LookPath("pbcopy"); err == nil {
@@ -682,7 +1046,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.appendOutput(errStyle.Render("No clipboard utility found (pbcopy/xclip/xsel/clip.exe)"))
 						return m, nil
 					}
-					
+
 					cmd.Stdin = strings.NewReader(textToCopy)
 					if err := cmd.Run(); err != nil {
 						m.appendOutput(errStyle.Render(fmt.Sprintf("Failed to copy: %v", err)))
@@ -690,7 +1054,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						lineCount := endLine - startLine + 1
 						m.appendOutput(okStyle.Render(fmt.Sprintf("✓ Copied %d line(s) to clipboard", lineCount)))
 					}
-					
+
 					return m, nil
 				}
 
@@ -709,15 +1073,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.currentDir = m.currentDir + "/" + newDir
 						}
 					}
-					
+
 					// Clear autocomplete words when changing directory
 					m.autocompleteWords = make(map[string]bool)
-					
+
 					// store in history
 					if len(m.history) == 0 || m.history[len(m.history)-1] != cmdline {
 						m.history = append(m.history, cmdline)
 					}
-					
+
 					// Show feedback without executing
 					dirDisplay := m.currentDir
 					if dirDisplay == "" {
@@ -734,7 +1098,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				m.loading = true
-				cmds = append(cmds, m.spin.Tick, runCommand(m.namespace, m.podName, m.container, cmdline, m.currentDir))
+				cmds = append(cmds, m.spin.Tick, runCommand(m.namespace, m.podName, m.container, cmdline, m.currentDir, m.useDebugContainer, m.debugContainer, m.targetRoot))
 				return m, tea.Batch(cmds...)
 			}
 
@@ -799,14 +1163,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.output.Reset()
 				m.vp.SetContent("")
 				m.input.Focus()
-				
+
 				// Ensure viewport is sized correctly when entering shell mode
 				if m.width > 0 && m.height > 0 {
 					m.vp.Width = m.width - 2
 					m.vp.Height = m.height - 3
 					m.input.Width = m.width - 2
 				}
-				
+
 				return m, nil
 			}
 		}
@@ -872,9 +1236,28 @@ func main() {
 	}
 
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	finalModel, err := p.Run()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
 
+	// After TUI exits and screen is restored, do cleanup
+	if m, ok := finalModel.(*model); ok {
+		if m.changedPodSecurityPolicy {
+			if m.originalPodSecurityPolicy == "" {
+				fmt.Println("Removing PodSecurity policy label...")
+			} else {
+				fmt.Printf("Restoring namespace policy to '%s'...\n", m.originalPodSecurityPolicy)
+			}
+
+			if err := setPodSecurityPolicy(m.namespace, m.originalPodSecurityPolicy); err != nil {
+				fmt.Printf("Failed to restore policy: %v\n", err)
+			} else {
+				fmt.Println("✓ Policy restored successfully")
+			}
+
+			time.Sleep(2 * time.Second)
+		}
+	}
+}

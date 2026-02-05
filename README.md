@@ -11,6 +11,7 @@ Unlike traditional `kubectl exec -it` which requires a TTY and keeps an open con
 - **Non-blocking**: Commands complete and disconnect, preventing hung connections
 - **Enhanced output**: Scrollable, numbered output with copy functionality
 - **Works with non-TTY environments**: Compatible with containers that don't support interactive shells
+- **Automatic debug container**: Detects scratch/distroless containers and creates ephemeral debug containers automatically
 
 ## Features
 
@@ -33,6 +34,33 @@ Once connected to a pod container, you get an interactive shell **experience** w
 - **Copy to clipboard** - Copy specific line ranges from output
 
 **Important**: This is not a persistent shell session. Each command is executed independently, but the application maintains state to provide a seamless shell-like experience.
+
+### Scratch and Distroless Container Support
+
+kcmd automatically detects when a container has no shell utilities (scratch, distroless, or minimal containers) and creates an **ephemeral debug container** to provide full shell functionality:
+
+- Automatically triggered when the first command fails with "executable file not found"
+- Creates a debug container with `busybox` image running as root
+- Uses process namespace sharing (`--target`) to access the target container via `/proc/<pid>/root`
+- Commands execute in the debug container but operate on the target container's complete filesystem
+- Provides full shell utilities (ls, grep, find, etc.) and access to the application binary
+
+**Automatic PodSecurity Policy Management:**
+
+Debug containers require running as root with `nsenter` capabilities to access the target container's filesystem. If the namespace has **restricted** PodSecurity policy, kcmd will:
+
+1. Detect the policy restriction when debug container creation fails
+2. Automatically change the namespace policy to **privileged** 
+3. Retry debug container creation
+4. Restore the original policy when you quit (press `q`)
+
+This means scratch/distroless container debugging works seamlessly without manual intervention. The policy change is temporary and automatically cleaned up.
+
+**Note**: The **privileged** policy is required because even **baseline** doesn't grant sufficient capabilities for `nsenter` to access another container's namespaces. This is necessary to access the complete filesystem of scratch/distroless containers.
+
+**Requirements:**
+- User must have permission to modify namespace labels (`kubectl label namespace`)
+- Policy is restored to original value on clean exit (Ctrl+C or `q`)
 
 ### Tab Completion
 
