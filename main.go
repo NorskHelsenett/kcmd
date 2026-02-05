@@ -568,15 +568,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					dirPath := lastWord[:lastSlash+1]
 					partialFile := lastWord[lastSlash+1:]
 					
-					// Query filesystem in pod for matching files
-					lsCmd := fmt.Sprintf("ls -1 %s 2>/dev/null | grep '^%s'", dirPath, partialFile)
+					// Query filesystem in pod for matching files/directories
+					// Use -F to append / to directories, -1 for one per line
+					lsCmd := fmt.Sprintf("ls -1F %s 2>/dev/null | grep '^%s'", dirPath, partialFile)
 					stdout, _, err := execInPod(m.namespace, m.podName, m.container, lsCmd, m.currentDir)
 					
 					if err == nil && stdout != "" {
 						lines := strings.Split(strings.TrimSpace(stdout), "\n")
 						if len(lines) > 0 && lines[0] != "" {
-							// Use first match
-							words[len(words)-1] = dirPath + lines[0]
+							// Use first match (already has / appended if directory thanks to -F)
+							completedPath := dirPath + lines[0]
+							words[len(words)-1] = completedPath
 							m.input.SetValue(strings.Join(words, " "))
 							m.input.CursorEnd()
 						}
