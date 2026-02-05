@@ -1,6 +1,16 @@
 # kcmd
 
-A terminal user interface (TUI) for executing commands inside Kubernetes pods with interactive selection and shell features.
+A terminal user interface (TUI) for executing commands inside Kubernetes pods with an interactive shell experience, **without requiring an interactive shell connection**.
+
+Unlike traditional `kubectl exec -it` which requires a TTY and keeps an open connection, kcmd executes each command independently while maintaining state (working directory, command history) on the client side. This provides a shell-like experience with better reliability and additional features like scrollable output, line numbers, and clipboard integration.
+
+## Key Difference from kubectl exec -it
+
+- **No persistent connection**: Each command runs independently via `kubectl exec` without TTY allocation
+- **Client-side state**: Working directory tracking, history, and autocomplete are managed locally
+- **Non-blocking**: Commands complete and disconnect, preventing hung connections
+- **Enhanced output**: Scrollable, numbered output with copy functionality
+- **Works with non-TTY environments**: Compatible with containers that don't support interactive shells
 
 ## Features
 
@@ -11,15 +21,18 @@ A terminal user interface (TUI) for executing commands inside Kubernetes pods wi
 - Select container if pod has multiple containers
 
 ### Interactive Shell
-Once connected to a pod container, you get an interactive shell with:
 
-- **Command execution** - Run any shell command in the container
+Once connected to a pod container, you get an interactive shell **experience** with:
+
+- **Command execution** - Run any shell command in the container (each as a separate kubectl exec)
 - **Working directory tracking** - Use `cd` to change directories; all subsequent commands run in that context
-- **Command history** - Navigate with up/down arrow keys
+- **Command history** - Navigate with up/down arrow keys through previously executed commands
 - **Output scrolling** - Scroll through output with PgUp/PgDn or arrow keys
 - **Line numbers** - All output is numbered for easy reference
 - **Tab completion** - Autocomplete filesystem paths and words from output
 - **Copy to clipboard** - Copy specific line ranges from output
+
+**Important**: This is not a persistent shell session. Each command is executed independently, but the application maintains state to provide a seamless shell-like experience.
 
 ### Tab Completion
 
@@ -154,6 +167,21 @@ tail -f app<Tab>
 
 ## Technical Details
 
+### Command Execution Model
+
+kcmd does **not** use `kubectl exec -it` or maintain a persistent shell connection. Instead:
+
+- Each command is executed as a separate `kubectl exec` call without TTY allocation
+- Commands use `sh -lc` for execution to support pipes, redirects, and shell features
+- Client-side state tracking simulates a persistent session
+- Working directory changes are implemented by prefixing commands with `cd <dir> &&`
+
+This approach provides several advantages:
+- **Reliability**: No risk of hung or dropped connections
+- **Compatibility**: Works with containers that don't support interactive TTY
+- **Enhanced features**: Scrollable output, line numbering, and clipboard integration
+- **State preservation**: Directory context and history maintained across command executions
+
 ### Command Execution
 
 Commands are executed using `kubectl exec` with the following behavior:
@@ -177,10 +205,12 @@ The `cd` command is handled locally without remote execution:
 
 ## Limitations
 
-- Commands requiring TTY interaction (like `vim`, `top`) will not work properly
-- Tab completion queries the filesystem, which adds slight latency
-- Autocomplete dictionary is cleared when changing directories
-- History is not persisted between sessions
+- **No persistent shell state**: Each command runs independently; shell variables, functions, and session state don't persist
+- **Commands requiring TTY interaction**: Tools like `vim`, `nano`, `top`, or any interactive programs will not work properly
+- **Tab completion latency**: Filesystem autocomplete queries the pod, which adds slight delay
+- **Autocomplete scope**: Dictionary is cleared when changing directories
+- **No session persistence**: History and state are lost when the application exits
+- **Performance**: Not suitable for high-frequency command execution due to kubectl overhead per command
 
 ## License
 
