@@ -361,22 +361,22 @@ func (m *model) header() string {
 	target := fmt.Sprintf("ns=%s type=%s pod=%s container=%s", m.namespace, m.rtype, m.podName, m.container)
 	switch m.step {
 	case stepPickNS:
-		return titleStyle.Render("KUI — Velg namespace")
+		return titleStyle.Render("KCMD — Velg namespace")
 	case stepPickType:
-		return titleStyle.Render("KUI — Velg type")
+		return titleStyle.Render("KCMD — Velg type")
 	case stepPickOwnerOrPod:
 		if m.rtype == rtPod {
-			return titleStyle.Render("KUI — Velg pod") + "  " + helpStyle.Render(target)
+			return titleStyle.Render("KCMD — Velg pod") + "  " + helpStyle.Render(target)
 		}
-		return titleStyle.Render("KUI — Velg workload (deployment/statefulset)") + "  " + helpStyle.Render(target)
+		return titleStyle.Render("KCMD — Velg workload (deployment/statefulset)") + "  " + helpStyle.Render(target)
 	case stepPickPodFromOwner:
-		return titleStyle.Render("KUI — Velg pod fra workload") + "  " + helpStyle.Render(target)
+		return titleStyle.Render("KCMD — Velg pod fra workload") + "  " + helpStyle.Render(target)
 	case stepPickContainer:
-		return titleStyle.Render("KUI — Velg container") + "  " + helpStyle.Render(target)
+		return titleStyle.Render("KCMD — Velg container") + "  " + helpStyle.Render(target)
 	case stepShell:
-		return titleStyle.Render("KUI — Shell") + "  " + helpStyle.Render(target)
+		return titleStyle.Render("KCMD — Shell") + "  " + helpStyle.Render(target)
 	default:
-		return titleStyle.Render("KUI")
+		return titleStyle.Render("KCMD")
 	}
 }
 
