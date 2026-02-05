@@ -386,40 +386,21 @@ func createDebugContainer(namespace, pod, targetContainer string) (string, strin
 		return "", "", fmt.Errorf("failed to create ephemeral container: %w (stderr: %s)", err, stderr.String())
 	}
 
-	// Wait for container to be ready
-	time.Sleep(3 * time.Second)
+	// Wait for the ephemeral container to be ready (up to 10 seconds)
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		checkCmd := []string{"get", "pod", pod, "-n", namespace, "-o", "jsonpath={.status.ephemeralContainerStatuses[?(@.name==\"" + debugName + "\")].state.running}"}
+		out, _, err := runKubectl(checkCmd...)
+		if err == nil && len(out) > 0 && string(out) != "map[]" {
+			// Container is running
+			break
+		}
+	}
 
 	// Find the target container's PID
 	// With --target, we share process namespace, so target processes are visible
-	// Look for the process that's NOT sleep (our debug container)
-
-	findPIDCmd := []string{
-		"-n", namespace, "exec", pod,
-		"-c", debugName,
-		"--",
-		"sh", "-c",
-		// List all processes, exclude sleep and sh, take the first one
-		"ps -o pid,comm | grep -v 'PID' | grep -v 'sleep' | grep -v 'sh' | grep -v 'ps' | grep -v 'grep' | head -1 | awk '{print $1}'",
-	}
-	pidOut, _, _ := runKubectl(findPIDCmd...)
-	pid := strings.TrimSpace(string(pidOut))
-
-	if pid == "" {
-		// Fallback: try to find by listing /proc and checking cmdline
-		findPIDCmd2 := []string{
-			"-n", namespace, "exec", pod,
-			"-c", debugName,
-			"--",
-			"sh", "-c",
-			"for p in /proc/[0-9]*; do [ -f $p/cmdline ] && [ -s $p/cmdline ] && cat $p/cmdline 2>/dev/null | grep -qv sleep && echo $(basename $p) && break; done",
-		}
-		pidOut2, _, _ := runKubectl(findPIDCmd2...)
-		pid = strings.TrimSpace(string(pidOut2))
-	}
-
-	if pid == "" {
-		return "", "", fmt.Errorf("could not find target container PID")
-	}
+	// Simply use PID 1 which is always the main process of the target container
+	pid := "1"
 
 	// Test if nsenter is available and works
 	testNsenterCmd := []string{
@@ -881,41 +862,75 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Get the last word being typed
 				lastWord := words[len(words)-1]
 
-				// Check if it looks like a path (contains /)
+				// Determine directory and partial filename
+				var dirPath, partialFile string
+				
 				if strings.Contains(lastWord, "/") {
-					// Extract directory and partial filename
+					// Path with directory component: /usr/lo or config/us
 					lastSlash := strings.LastIndex(lastWord, "/")
-					dirPath := lastWord[:lastSlash+1]
-					partialFile := lastWord[lastSlash+1:]
+					dirPath = lastWord[:lastSlash+1]
+					partialFile = lastWord[lastSlash+1:]
+				} else {
+					// No slash: relative to current directory
+					dirPath = "./"
+					partialFile = lastWord
+				}
 
-					// Query filesystem for autocomplete - use ls -p to append / to directories
-					lsCmd := fmt.Sprintf(
-						`ls -1p %s 2>/dev/null | grep '^%s'`,
-						dirPath, partialFile,
-					)
+				// Query filesystem for autocomplete
+				// First list files, then check if first match is a directory
+				listCmd := fmt.Sprintf(
+					`for f in %s%s*; do [ -e "$f" ] && echo "$f" && break; done 2>/dev/null`,
+					dirPath, partialFile,
+				)
 
-					var stdout string
-					var err error
+				var stdout string
+				var err error
 
-					// Use appropriate execution method based on whether we're in debug container
+				// Use appropriate execution method based on whether we're in debug container
+				if m.useDebugContainer {
+					stdout, _, err = execInDebugContainer(m.namespace, m.podName, m.debugContainer, m.targetRoot, listCmd, m.currentDir)
+				} else {
+					stdout, _, err = execInPod(m.namespace, m.podName, m.container, listCmd, m.currentDir)
+				}
+				
+				// If we got a match, check if it's a directory
+				if err == nil && stdout != "" {
+					firstMatch := strings.TrimSpace(stdout)
+					// Extract just the basename
+					if strings.Contains(firstMatch, "/") {
+						firstMatch = firstMatch[strings.LastIndex(firstMatch, "/")+1:]
+					}
+					
+					// Check if it's a directory
+					checkDirCmd := fmt.Sprintf(`[ -d "%s%s" ] && echo "DIR" || echo "FILE"`, dirPath, firstMatch)
+					var isDirOut string
 					if m.useDebugContainer {
-						stdout, _, err = execInDebugContainer(m.namespace, m.podName, m.debugContainer, m.targetRoot, lsCmd, m.currentDir)
+						isDirOut, _, _ = execInDebugContainer(m.namespace, m.podName, m.debugContainer, m.targetRoot, checkDirCmd, m.currentDir)
 					} else {
-						stdout, _, err = execInPod(m.namespace, m.podName, m.container, lsCmd, m.currentDir)
+						isDirOut, _, _ = execInPod(m.namespace, m.podName, m.container, checkDirCmd, m.currentDir)
 					}
-
-					if err == nil && stdout != "" {
-						lines := strings.Split(strings.TrimSpace(stdout), "\n")
-						if len(lines) > 0 && lines[0] != "" {
-							firstMatch := lines[0]
-							// ls -p adds / to directories, so just use the result directly
-							words[len(words)-1] = dirPath + firstMatch
-							m.input.SetValue(strings.Join(words, " "))
-							m.input.CursorEnd()
-						}
+					
+					isDirOut = strings.TrimSpace(isDirOut)
+					
+					// Append / if it's a directory
+					if isDirOut == "DIR" {
+						firstMatch = firstMatch + "/"
 					}
-					// If autocomplete fails (no ls/sh), silently do nothing
-				} else if len(lastWord) >= 2 {
+					
+					// Update input
+					if dirPath == "./" {
+						words[len(words)-1] = firstMatch
+					} else {
+						words[len(words)-1] = dirPath + firstMatch
+					}
+					
+					m.input.SetValue(strings.Join(words, " "))
+					m.input.CursorEnd()
+					return m, nil  // Don't fall through to word-based autocomplete
+				}
+				
+				// Fall back to word-based autocomplete from output if len >= 2
+				if len(lastWord) >= 2 {
 					// Fall back to word-based autocomplete from output
 					var matches []string
 					for word := range m.autocompleteWords {
@@ -963,17 +978,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				cmdline := strings.TrimSpace(m.input.Value())
 
-				// Debug to file since stderr gets cleared
-				f, _ := os.OpenFile("/tmp/kcmd-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if f != nil {
-					fmt.Fprintf(f, "\n=== ENTER PRESSED ===\n")
-					fmt.Fprintf(f, "cmdline: '%s'\n", cmdline)
-					fmt.Fprintf(f, "cmdline == '/quit': %v\n", cmdline == "/quit")
-					fmt.Fprintf(f, "len(cmdline): %d\n", len(cmdline))
-					fmt.Fprintf(f, "step: %v\n", m.step)
-					f.Close()
-				}
-
 				if cmdline == "" {
 					return m, nil
 				}
@@ -989,17 +993,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Check if command is /quit to quit application
 				if cmdline == "/quit" {
-					f, _ := os.OpenFile("/tmp/kcmd-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if f != nil {
-						fmt.Fprintf(f, "\n=== QUIT TRIGGERED ===\n")
-						fmt.Fprintf(f, "changedPodSecurityPolicy: %v\n", m.changedPodSecurityPolicy)
-						fmt.Fprintf(f, "originalPodSecurityPolicy: '%s'\n", m.originalPodSecurityPolicy)
-						fmt.Fprintf(f, "namespace: %s\n", m.namespace)
-						fmt.Fprintf(f, "useDebugContainer: %v\n", m.useDebugContainer)
-						fmt.Fprintf(f, "debugContainer: %s\n", m.debugContainer)
-						f.Close()
-					}
-
 					// Note: Ephemeral containers cannot be removed from running pods
 					// They persist until the pod is deleted/restarted
 					// Policy restoration will happen in main() after TUI exits
@@ -1258,6 +1251,26 @@ func main() {
 			}
 
 			time.Sleep(2 * time.Second)
+		}
+
+		// Offer to delete pod if ephemeral container was used
+		if m.debugContainer != "" {
+			fmt.Printf("\nEphemeral container '%s' was created in pod '%s'.\n", m.debugContainer, m.podName)
+			fmt.Println("Ephemeral containers cannot be removed without deleting the pod.")
+			fmt.Print("Delete and recreate the pod? [y/N]: ")
+
+			var response string
+			fmt.Scanln(&response)
+			if strings.ToLower(strings.TrimSpace(response)) == "y" {
+				fmt.Printf("Deleting pod '%s'...\n", m.podName)
+				args := []string{"delete", "pod", m.podName, "-n", m.namespace}
+				_, stderr, err := runKubectl(args...)
+				if err != nil {
+					fmt.Printf("Failed to delete pod: %v (stderr: %s)\n", err, string(stderr))
+				} else {
+					fmt.Println("✓ Pod deleted successfully. It will be recreated by the controller.")
+				}
+			}
 		}
 	}
 }
