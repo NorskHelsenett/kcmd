@@ -58,7 +58,7 @@ type Model struct {
 	Quitting bool
 }
 
-func InitialModel() Model {
+func InitialModel() *Model {
 	delegate := list.NewDefaultDelegate()
 	delegate.ShowDescription = false
 	delegate.SetSpacing(0)
@@ -79,7 +79,7 @@ func InitialModel() Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
-	return Model{
+	return &Model{
 		Step:              types.StepPickNS,
 		Lst:               l,
 		Input:             in,

@@ -6,6 +6,6 @@ import (
 	"kui/internal/types"
 )
 
-func (m Model) Init() tea.Cmd {
+func (m *Model) Init() tea.Cmd {
 	return tea.Batch(m.Spin.Tick, loadStep(types.StepPickNS, m))
 }

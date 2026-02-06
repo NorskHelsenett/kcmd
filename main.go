@@ -26,7 +26,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if m, ok := finalModel.(tui.Model); ok {
+	if m, ok := finalModel.(*tui.Model); ok {
 		if m.ChangedPodSecurityPolicy {
 			if m.OriginalPodSecurityPolicy == "" {
 				fmt.Println("Removing PodSecurity policy label...")

@@ -14,7 +14,7 @@ import (
 	"kui/internal/types"
 )
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -180,7 +180,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleKeyPress(msg tea.KeyMsg, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
+func (m *Model) handleKeyPress(msg tea.KeyMsg, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
 	k := msg.String()
 
 	if k == "ctrl+c" {
@@ -198,7 +198,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg, cmds *[]tea.Cmd) (tea.Model, tea.C
 	return m.handleSelection(k, cmds)
 }
 
-func (m Model) handleBackNavigation() (tea.Model, tea.Cmd) {
+func (m *Model) handleBackNavigation() (tea.Model, tea.Cmd) {
 	switch m.Step {
 	case types.StepPickType:
 		m.Step = types.StepPickNS
@@ -225,7 +225,7 @@ func (m Model) handleBackNavigation() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleShellInput(k string, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
+func (m *Model) handleShellInput(k string, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
 	switch k {
 	case "ctrl+r":
 		m = InitialModel()
@@ -251,7 +251,7 @@ func (m Model) handleShellInput(k string, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) 
 	return m, tea.Batch(*cmds...)
 }
 
-func (m Model) handleAutocomplete() tea.Model {
+func (m *Model) handleAutocomplete() tea.Model {
 	currentInput := m.Input.Value()
 	words := strings.Fields(currentInput)
 	if len(words) == 0 {
@@ -334,7 +334,7 @@ func (m Model) handleAutocomplete() tea.Model {
 	return m
 }
 
-func (m Model) handleHistoryUp() tea.Model {
+func (m *Model) handleHistoryUp() tea.Model {
 	if len(m.History) == 0 {
 		return m
 	}
@@ -348,7 +348,7 @@ func (m Model) handleHistoryUp() tea.Model {
 	return m
 }
 
-func (m Model) handleHistoryDown() tea.Model {
+func (m *Model) handleHistoryDown() tea.Model {
 	if len(m.History) == 0 {
 		return m
 	}
@@ -366,7 +366,7 @@ func (m Model) handleHistoryDown() tea.Model {
 	return m
 }
 
-func (m Model) handleCommand(cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
+func (m *Model) handleCommand(cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
 	cmdline := strings.TrimSpace(m.Input.Value())
 
 	if cmdline == "" {
@@ -403,7 +403,7 @@ func (m Model) handleCommand(cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(*cmds...)
 }
 
-func (m Model) handleCopyCommand(cmdline string) tea.Model {
+func (m *Model) handleCopyCommand(cmdline string) tea.Model {
 	rangeStr := strings.TrimSpace(strings.TrimPrefix(cmdline, "/copy"))
 	var startLine, endLine int
 
@@ -449,7 +449,7 @@ func (m Model) handleCopyCommand(cmdline string) tea.Model {
 	return m
 }
 
-func (m Model) handleCdCommand(cmdline string) tea.Model {
+func (m *Model) handleCdCommand(cmdline string) tea.Model {
 	newDir := strings.TrimSpace(strings.TrimPrefix(cmdline, "cd"))
 	if newDir == "" || newDir == "~" {
 		m.CurrentDir = ""
@@ -478,7 +478,7 @@ func (m Model) handleCdCommand(cmdline string) tea.Model {
 	return m
 }
 
-func (m Model) handleSelection(k string, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
+func (m *Model) handleSelection(k string, cmds *[]tea.Cmd) (tea.Model, tea.Cmd) {
 	switch k {
 	case "enter":
 		if len(m.Lst.Items()) == 0 {

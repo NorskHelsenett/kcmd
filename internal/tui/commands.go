@@ -9,7 +9,7 @@ import (
 	"kui/internal/types"
 )
 
-func loadStep(s types.Step, m Model) tea.Cmd {
+func loadStep(s types.Step, m *Model) tea.Cmd {
 	return func() tea.Msg {
 		var vals []string
 		var err error
