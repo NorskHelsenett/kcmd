@@ -246,12 +246,17 @@ func CreateDebugContainer(namespace, pod, targetContainer string) (string, strin
 		return "", "", fmt.Errorf("failed to create ephemeral container: %w (stderr: %s)", err, stderr.String())
 	}
 
-	for i := 0; i < 20; i++ {
+	// Wait for container to be running
+	for i := 0; i < 30; i++ {
 		time.Sleep(500 * time.Millisecond)
 		checkCmd := []string{"get", "pod", pod, "-n", namespace, "-o", "jsonpath={.status.ephemeralContainerStatuses[?(@.name==\"" + debugName + "\")].state.running}"}
 		out, _, err := Run(checkCmd...)
 		if err == nil && len(out) > 0 && string(out) != "map[]" {
-			break
+			// Also verify we can exec into it
+			testCmd := []string{"-n", namespace, "exec", pod, "-c", debugName, "--", "echo", "ready"}
+			if _, _, execErr := Run(testCmd...); execErr == nil {
+				break
+			}
 		}
 	}
 
@@ -308,4 +313,57 @@ func ExecInDebugContainer(namespace, pod, debugContainer, targetRoot, cmdline, c
 
 	out, errb, err := Run("-n", namespace, "exec", pod, "-c", debugContainer, "--", "sh", "-c", fullCmd)
 	return string(out), string(errb), err
+}
+
+// WaitForDebugContainerReady waits for an ephemeral debug container to be ready
+func WaitForDebugContainerReady(namespace, pod, debugContainer string) error {
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		time.Sleep(500 * time.Millisecond)
+		
+		// Check container status
+		podJSON, _, err := Run("get", "pod", pod, "-n", namespace, "-o", "json")
+		if err != nil {
+			return fmt.Errorf("failed to get pod status: %w", err)
+		}
+		
+		var podStatus map[string]interface{}
+		if err := json.Unmarshal(podJSON, &podStatus); err != nil {
+			return fmt.Errorf("failed to parse pod status: %w", err)
+		}
+		
+		// Check ephemeralContainerStatuses
+		status := podStatus["status"].(map[string]interface{})
+		ephStatuses, ok := status["ephemeralContainerStatuses"].([]interface{})
+		if ok {
+			for _, s := range ephStatuses {
+				st := s.(map[string]interface{})
+				if st["name"] == debugContainer {
+					// Check if ready
+					if ready, ok := st["ready"].(bool); ok && ready {
+						return nil
+					}
+					
+					// Check for errors
+					if state, ok := st["state"].(map[string]interface{}); ok {
+						if waiting, ok := state["waiting"].(map[string]interface{}); ok {
+							reason := waiting["reason"].(string)
+							message := waiting["message"].(string)
+							if reason == "CreateContainerConfigError" {
+								return fmt.Errorf("debug container failed to start: %s\n\nThis namespace likely has additional policy enforcement (Kyverno/OPA) preventing root containers.\nSuggested workaround: temporarily disable the policy or use a non-root debug image", message)
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Try to execute a simple command
+		_, _, execErr := Run("-n", namespace, "exec", pod, "-c", debugContainer, "--", "echo", "ready")
+		if execErr == nil {
+			return nil
+		}
+	}
+	
+	return errors.New("debug container did not become ready in time")
 }

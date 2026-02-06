@@ -162,6 +162,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.AppendOutput(OkStyle.Render(fmt.Sprintf("Debug container '%s' created.", msg.DebugContainer)))
 		m.AppendOutput(fmt.Sprintf("Target container filesystem: %s", msg.TargetRoot))
 		m.AppendOutput("")
+		m.AppendOutput("Waiting for debug container to be ready...")
+
+		// Wait for the debug container to be ready
+		if err := kubectl.WaitForDebugContainerReady(m.Namespace, m.PodName, msg.DebugContainer); err != nil {
+			m.AppendOutput(ErrStyle.Render(fmt.Sprintf("Debug container failed to start: %v", err)))
+			return m, nil
+		}
+
 		m.AppendOutput("Testing filesystem access...")
 
 		testCmd := fmt.Sprintf("ls %s 2>&1 | head -5", msg.TargetRoot)
