@@ -188,19 +188,19 @@ func SetPodSecurityPolicy(namespace, policy string) error {
 func CreateDebugContainer(namespace, pod, targetContainer string) (string, string, error) {
 	debugName := fmt.Sprintf("kcmd-debug-%d", time.Now().Unix())
 
-	ephemeralContainer := map[string]interface{}{
+	ephemeralContainer := map[string]any{
 		"name":                debugName,
 		"image":               "busybox:latest",
 		"targetContainerName": targetContainer,
 		"command":             []string{"sleep", "3600"},
-		"securityContext": map[string]interface{}{
+		"securityContext": map[string]any{
 			"allowPrivilegeEscalation": false,
 			"runAsUser":                0,
-			"capabilities": map[string]interface{}{
+			"capabilities": map[string]any{
 				"drop": []string{"ALL"},
 				"add":  []string{"SYS_ADMIN", "SYS_CHROOT", "SYS_PTRACE"},
 			},
-			"seccompProfile": map[string]interface{}{
+			"seccompProfile": map[string]any{
 				"type": "RuntimeDefault",
 			},
 		},
@@ -212,15 +212,15 @@ func CreateDebugContainer(namespace, pod, targetContainer string) (string, strin
 		return "", "", fmt.Errorf("failed to get pod: %w", err)
 	}
 
-	var podSpec map[string]interface{}
+	var podSpec map[string]any
 	if err := json.Unmarshal(podJSON, &podSpec); err != nil {
 		return "", "", fmt.Errorf("failed to parse pod spec: %w", err)
 	}
 
-	spec := podSpec["spec"].(map[string]interface{})
-	ephemeralContainers, ok := spec["ephemeralContainers"].([]interface{})
+	spec := podSpec["spec"].(map[string]any)
+	ephemeralContainers, ok := spec["ephemeralContainers"].([]any)
 	if !ok {
-		ephemeralContainers = []interface{}{}
+		ephemeralContainers = []any{}
 	}
 	ephemeralContainers = append(ephemeralContainers, ephemeralContainer)
 	spec["ephemeralContainers"] = ephemeralContainers
@@ -247,7 +247,7 @@ func CreateDebugContainer(namespace, pod, targetContainer string) (string, strin
 	}
 
 	// Wait for container to be running
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		time.Sleep(500 * time.Millisecond)
 		checkCmd := []string{"get", "pod", pod, "-n", namespace, "-o", "jsonpath={.status.ephemeralContainerStatuses[?(@.name==\"" + debugName + "\")].state.running}"}
 		out, _, err := Run(checkCmd...)
@@ -289,7 +289,7 @@ func ExecInPod(namespace, pod, container, cmdline, currentDir string) (string, s
 }
 
 func ExecInDebugContainer(namespace, pod, debugContainer, targetRoot, cmdline, currentDir string) (string, string, error) {
-	if strings.HasPrefix(targetRoot, "NSENTER:") {
+	if _, ok := strings.CutPrefix(targetRoot, "NSENTER:"); ok {
 		pid := strings.TrimPrefix(targetRoot, "NSENTER:")
 
 		targetCmd := cmdline
@@ -318,35 +318,36 @@ func ExecInDebugContainer(namespace, pod, debugContainer, targetRoot, cmdline, c
 // WaitForDebugContainerReady waits for an ephemeral debug container to be ready
 func WaitForDebugContainerReady(namespace, pod, debugContainer string) error {
 	maxRetries := 10
-	for i := 0; i < maxRetries; i++ {
+
+	for range maxRetries {
 		time.Sleep(500 * time.Millisecond)
-		
+
 		// Check container status
 		podJSON, _, err := Run("get", "pod", pod, "-n", namespace, "-o", "json")
 		if err != nil {
 			return fmt.Errorf("failed to get pod status: %w", err)
 		}
-		
-		var podStatus map[string]interface{}
+
+		var podStatus map[string]any
 		if err := json.Unmarshal(podJSON, &podStatus); err != nil {
 			return fmt.Errorf("failed to parse pod status: %w", err)
 		}
-		
+
 		// Check ephemeralContainerStatuses
-		status := podStatus["status"].(map[string]interface{})
-		ephStatuses, ok := status["ephemeralContainerStatuses"].([]interface{})
+		status := podStatus["status"].(map[string]any)
+		ephStatuses, ok := status["ephemeralContainerStatuses"].([]any)
 		if ok {
 			for _, s := range ephStatuses {
-				st := s.(map[string]interface{})
+				st := s.(map[string]any)
 				if st["name"] == debugContainer {
 					// Check if ready
 					if ready, ok := st["ready"].(bool); ok && ready {
 						return nil
 					}
-					
+
 					// Check for errors
-					if state, ok := st["state"].(map[string]interface{}); ok {
-						if waiting, ok := state["waiting"].(map[string]interface{}); ok {
+					if state, ok := st["state"].(map[string]any); ok {
+						if waiting, ok := state["waiting"].(map[string]any); ok {
 							reason := waiting["reason"].(string)
 							message := waiting["message"].(string)
 							if reason == "CreateContainerConfigError" {
@@ -357,13 +358,13 @@ func WaitForDebugContainerReady(namespace, pod, debugContainer string) error {
 				}
 			}
 		}
-		
+
 		// Try to execute a simple command
 		_, _, execErr := Run("-n", namespace, "exec", pod, "-c", debugContainer, "--", "echo", "ready")
 		if execErr == nil {
 			return nil
 		}
 	}
-	
+
 	return errors.New("debug container did not become ready in time")
 }
