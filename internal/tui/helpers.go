@@ -43,9 +43,9 @@ func (m *Model) AppendOutput(s string) {
 
 		lineNum := len(m.OutputLines)
 		if line != "" {
-			numbered.WriteString(fmt.Sprintf("%4d │ %s\n", lineNum, line))
+			fmt.Fprintf(&numbered, "%4d │ %s\n", lineNum, line)
 		} else {
-			numbered.WriteString(fmt.Sprintf("%4d │\n", lineNum))
+			fmt.Fprintf(&numbered, "%4d │ \n", lineNum)
 		}
 	}
 
